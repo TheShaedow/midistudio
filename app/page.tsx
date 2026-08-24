@@ -50,7 +50,7 @@ export default function Home() {
   const [metronome, setMetronome] = useState(true), [status, setStatus] = useState('MIDI verbinden'), [position, setPosition] = useState(0);
   const [selected, setSelected] = useState<number | null>(null);
   const audioRef = useRef<AudioContext | null>(null), timersRef = useRef<number[]>([]);
-  const activeRef = useRef(new Map<number, { start: number; velocity: number }>()), recordStartRef = useRef(0), nextId = useRef(20);
+  const activeRef = useRef(new Map<number, { start: number; velocity: number }>()), recordStartRef = useRef(0), recordingRef = useRef(false), nextId = useRef(20);
   const getAudio = useCallback(() => { if (!audioRef.current) audioRef.current = new AudioContext(); void audioRef.current.resume(); return audioRef.current; }, []);
   const playTone = useCallback((pitch: number, velocity = 96, duration = .5, at?: number) => {
     const ctx = getAudio(), start = at ?? ctx.currentTime, gain = ctx.createGain(), filter = ctx.createBiquadFilter();
@@ -62,7 +62,7 @@ export default function Home() {
     waves.forEach(([ratio, type], i) => { const osc = ctx.createOscillator(), local = ctx.createGain(); osc.type = type; osc.frequency.value = fre * ratio; local.gain.value = sound === 'piano' ? 1 / (i + 1.5) : .18; osc.connect(local).connect(gain); osc.start(start); osc.stop(start + duration + release + .2); });
   }, [getAudio, sound]);
   const tick = useCallback((accent = false, at?: number) => { const ctx = getAudio(), start = at ?? ctx.currentTime, osc = ctx.createOscillator(), gain = ctx.createGain(); osc.frequency.value = accent ? 1320 : 920; gain.gain.setValueAtTime(.12, start); gain.gain.exponentialRampToValueAtTime(.0001, start + .04); osc.connect(gain).connect(ctx.destination); osc.start(start); osc.stop(start + .05); }, [getAudio]);
-  const stop = useCallback(() => { timersRef.current.forEach(window.clearTimeout); timersRef.current = []; setPlaying(false); setRecording(false); setPosition(0); }, []);
+  const stop = useCallback(() => { timersRef.current.forEach(window.clearTimeout); timersRef.current = []; recordingRef.current = false; activeRef.current.clear(); setPlaying(false); setRecording(false); setPosition(0); }, []);
   const startPlayback = useCallback(() => {
     stop(); setPlaying(true); const ctx = getAudio(), beatSeconds = 60 / bpm, origin = ctx.currentTime + .08;
     const playbackBeats = Math.max(TOTAL_BEATS, Math.ceil(Math.max(0, ...notes.map(n => n.start + n.duration)) / 4) * 4);
@@ -71,7 +71,7 @@ export default function Home() {
     const started = performance.now() + 80; const update = () => { const beat = (performance.now() - started) / 1000 / beatSeconds; setPosition(Math.min(playbackBeats, Math.max(0, beat))); if (beat < playbackBeats) timersRef.current.push(window.setTimeout(update, 30)); else stop(); }; update();
   }, [bpm, getAudio, metronome, notes, playTone, stop, tick]);
   const startRecording = useCallback(() => { stop(); getAudio(); setStatus('2 Takte Preroll'); const beatMs = 60000 / bpm; for (let i = 0; i < 8; i++) timersRef.current.push(window.setTimeout(() => tick(i % 4 === 0), i * beatMs)); timersRef.current.push(window.setTimeout(() => {
-    setRecording(true); setPlaying(true); setStatus('Aufnahme läuft • Stopp zum Beenden'); recordStartRef.current = performance.now();
+    recordStartRef.current = performance.now(); recordingRef.current = true; activeRef.current.clear(); setPosition(0); setRecording(true); setPlaying(true); setStatus('Aufnahme läuft • Stopp zum Beenden');
     let beat = 0; const recordBeat = () => { if (metronome) tick(beat % 4 === 0); setPosition(beat); beat += 1; timersRef.current.push(window.setTimeout(recordBeat, beatMs)); }; recordBeat();
   }, beatMs * 8)); }, [bpm, getAudio, metronome, stop, tick]);
 
@@ -79,11 +79,11 @@ export default function Home() {
     if (!('requestMIDIAccess' in navigator)) { setStatus('Web MIDI nicht verfügbar'); return; }
     navigator.requestMIDIAccess().then(access => { const inputs = Array.from(access.inputs.values()); setStatus(inputs.length ? inputs[0].name || 'MIDI bereit' : 'Kein MIDI-Gerät');
       inputs.forEach(input => input.onmidimessage = event => { if (!event.data) return; const [command, pitch, velocity] = event.data;
-        if ((command & 0xf0) === 0x90 && velocity > 0) { playTone(pitch, velocity, .8); if (recording) activeRef.current.set(pitch, { start: (performance.now() - recordStartRef.current) / (60000 / bpm), velocity }); }
-        else if (((command & 0xf0) === 0x80 || ((command & 0xf0) === 0x90 && velocity === 0)) && recording) { const active = activeRef.current.get(pitch); if (active) { const rawEnd = (performance.now() - recordStartRef.current) / (60000 / bpm), step = quantizeStep(quantize), start = Math.round(active.start / step) * step, end = Math.round(rawEnd / step) * step, duration = Math.max(step, end - start); setNotes(old => [...old, { id: nextId.current++, pitch, start: Math.max(0, start), duration, velocity: active.velocity }]); activeRef.current.delete(pitch); } }
+        if ((command & 0xf0) === 0x90 && velocity > 0) { playTone(pitch, velocity, .8); if (recordingRef.current) activeRef.current.set(pitch, { start: Math.max(0, (performance.now() - recordStartRef.current) / (60000 / bpm)), velocity }); }
+        else if (((command & 0xf0) === 0x80 || ((command & 0xf0) === 0x90 && velocity === 0)) && recordingRef.current) { const active = activeRef.current.get(pitch); if (active) { const rawEnd = Math.max(active.start, (performance.now() - recordStartRef.current) / (60000 / bpm)), step = quantizeStep(quantize), start = Math.round(active.start / step) * step, end = Math.round(rawEnd / step) * step, duration = Math.max(step, end - start); setNotes(old => [...old, { id: nextId.current++, pitch, start: Math.max(0, start), duration, velocity: active.velocity }]); activeRef.current.delete(pitch); } }
       });
     }).catch(() => setStatus('MIDI-Zugriff erlauben'));
-  }, [bpm, playTone, quantize, recording]);
+  }, [bpm, playTone, quantize]);
 
   const exportMidi = () => { const events: { tick: number; bytes: number[] }[] = []; notes.forEach(n => { events.push({ tick: Math.round(n.start * PPQ), bytes: [0x90, n.pitch, n.velocity] }, { tick: Math.round((n.start + n.duration) * PPQ), bytes: [0x80, n.pitch, 0] }); }); events.sort((a, b) => a.tick - b.tick || a.bytes[0] - b.bytes[0]); const tempo = Math.round(60000000 / bpm), track = [0, 255, 81, 3, tempo >> 16 & 255, tempo >> 8 & 255, tempo & 255]; let last = 0; events.forEach(e => { track.push(...writeVar(e.tick - last), ...e.bytes); last = e.tick; }); track.push(0, 255, 47, 0); const len = track.length, bytes = [77,84,104,100,0,0,0,6,0,0,0,1,0,PPQ,77,84,114,107,(len>>>24)&255,(len>>>16)&255,(len>>>8)&255,len&255,...track], url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'audio/midi' })), a = document.createElement('a'); a.href = url; a.download = 'velvet-sequence.mid'; a.click(); URL.revokeObjectURL(url); };
   const rows = useMemo(() => Array.from({ length: 49 }, (_, i) => 96 - i), []), selectedNote = notes.find(n => n.id === selected);
